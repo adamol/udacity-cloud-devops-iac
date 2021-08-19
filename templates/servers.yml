@@ -1,0 +1,245 @@
+Parameters:
+
+  Project:
+    Description: Project name
+    Type: String
+    Default: Acme
+
+  WebServerImageAMI:
+    Description: AMI for web server
+    Type: String
+    Default: ami-05e1e66d082e56118
+
+  WebServerInstanceType:
+    Description: Instance type of web server
+    Type: String
+    Default: t3.medium
+
+  WebServerVolumeSize:
+    Description: Volume size of web server
+    Type: String
+    Default: 10
+
+  WebAppMinCount:
+    Description: Min server count
+    Type: String
+    Default: 2
+
+  WebAppMaxCount:
+    Description: Max server count
+    Type: String
+    Default: 4
+
+  CPUUsagePolicyTargetValue:
+    Description: Target CPU usage
+    Type: String
+    Default: 75.0
+
+  ALBRequestCountPolicyTargetValue:
+    Description: Allowed request count
+    Type: String
+    Default: 3
+
+  KeyName:
+    Description: Name of an existing KeyPair to enable SSH access to the web servers from bastion host.
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Default: udacity
+
+Resources:
+  # instace profile contains the IAM Role name(s) that we want to associate to our auto scaling EC2 Servers
+  # never give too much permissions to your EC2 instances! if they get hacked, the permissions get hacked also!
+  # in this example, I create a Role called UdacityS3ReadOnlyC2 and just give it a policy of S3 Read-Only Access
+  WebServerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref UdacityS3ReadOnlyEC2
+
+  UdacityS3ReadOnlyEC2:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our LB
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${Project}-VPCID"
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http from loadbalancer and ssh
+      GroupName: EC2-sg
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${Project}-VPCID"
+      SecurityGroupIngress:
+        - IpProtocol: TCP
+          SourceSecurityGroupId: !Ref LBSecGroup
+          FromPort: 80
+          ToPort: 80
+        - IpProtocol: TCP
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update -y
+          apt-get install unzip awscli -y
+          apt-get install apache2 -y
+          systemctl start apache2.service
+          cd /var/www/html
+          aws s3 cp s3://udacity-demo-1/udacity.zip .
+          unzip -o udacity.zip
+      ImageId: !Ref WebServerImageAMI
+      IamInstanceProfile: !Ref WebServerProfile
+      SecurityGroups:
+        - Ref: WebServerSecGroup
+      InstanceType: !Ref WebServerInstanceType
+      # Useful for debugging with bastion host
+      # KeyName: !Ref KeyName
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: !Ref WebServerVolumeSize
+
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - Fn::ImportValue: !Sub "${Project}-PUB1-SN"
+        - Fn::ImportValue: !Sub "${Project}-PUB2-SN"
+      SecurityGroups:
+        - !Ref LBSecGroup
+
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 30
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${Project}-VPCID"
+    DependsOn:
+      - WebAppLB
+
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTargetGroup
+      LoadBalancerArn: !Ref WebAppLB
+      Port: 80
+      Protocol: HTTP
+    DependsOn:
+      - WebAppLB
+      - WebAppTargetGroup
+
+  ALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTargetGroup
+      Conditions:
+        - Field: path-pattern
+          Values: [/]
+      ListenerArn: !Ref Listener
+      Priority: 1
+
+  WebAppASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${Project}-PRIV-NETS
+      LaunchConfigurationName: !Ref WebAppLaunchConfig
+      MinSize: !Ref WebAppMinCount
+      MaxSize: !Ref WebAppMaxCount
+      TargetGroupARNs:
+        - !Ref WebAppTargetGroup
+
+  ##### Scaling Policies #####
+  WebServerCPUPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAppASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CPUUsagePolicyTargetValue
+    DependsOn:
+      - Listener
+
+  WebServerRequestCountPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAppASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Join
+            - '/'
+            - - !GetAtt WebAppLB.LoadBalancerFullName
+              - !GetAtt WebAppTargetGroup.TargetGroupFullName
+        TargetValue: !Ref ALBRequestCountPolicyTargetValue
+    DependsOn:
+      - Listener
+
+Outputs:
+
+  URL:
+    Description: The website URL
+    Value:
+      !Sub
+      - "http://${LbDnsName}"
+      - {LbDnsName: !GetAtt "WebAppLB.DNSName"}
